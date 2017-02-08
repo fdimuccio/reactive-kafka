@@ -43,7 +43,7 @@ private[kafka] object ConsumerStage {
           override def groupId: String = settings.properties(ConsumerConfig.GROUP_ID_CONFIG)
           lazy val committer: Committer = {
             val ec = materializer.executionContext
-            new KafkaAsyncConsumerCommitterRef(consumer, settings.commitTimeout)(ec)
+            new KafkaAsyncConsumerCommitterRef(consumer, groupId, settings.commitTimeout)(ec)
           }
         }
     }
@@ -70,7 +70,7 @@ private[kafka] object ConsumerStage {
           override def groupId: String = settings.properties(ConsumerConfig.GROUP_ID_CONFIG)
           lazy val committer: Committer = {
             val ec = materializer.executionContext
-            new KafkaAsyncConsumerCommitterRef(consumer, settings.commitTimeout)(ec)
+            new KafkaAsyncConsumerCommitterRef(consumer, groupId, settings.commitTimeout)(ec)
           }
         }
     }
@@ -83,14 +83,14 @@ private[kafka] object ConsumerStage {
           override def groupId: String = _groupId
           lazy val committer: Committer = {
             val ec = materializer.executionContext
-            new KafkaAsyncConsumerCommitterRef(consumer, commitTimeout)(ec)
+            new KafkaAsyncConsumerCommitterRef(consumer, groupId, commitTimeout)(ec)
           }
         }
     }
   }
 
   // This should be case class to be comparable based on ref and timeout. This comparison is used in CommittableOffsetBatchImpl
-  case class KafkaAsyncConsumerCommitterRef(ref: ActorRef, timeout: FiniteDuration)(implicit ec: ExecutionContext) extends Committer {
+  case class KafkaAsyncConsumerCommitterRef(ref: ActorRef, groupId: String, timeout: FiniteDuration)(implicit ec: ExecutionContext) extends Committer {
     import akka.pattern.ask
     implicit val to = Timeout(timeout)
     override def commit(offset: PartitionOffset): Future[Done] = {
@@ -100,8 +100,10 @@ private[kafka] object ConsumerStage {
       (ref ? Commit(offsets)).mapTo[Committed].map(_ => Done)
     }
     override def commit(batch: CommittableOffsetBatch): Future[Done] = {
-      val offsets = batch.offsets.map {
-        case (ctp, offset) => new TopicPartition(ctp.topic, ctp.partition) -> (offset + 1)
+      val offsets = batch.offsets.collect {
+        // This will filter out TopicPartition not belonging to this Committer
+        case (ctp, offset) if ctp.groupId == groupId =>
+          new TopicPartition(ctp.topic, ctp.partition) -> (offset + 1)
       }
       (ref ? Commit(offsets)).mapTo[Committed].map(_ => Done)
     }
@@ -190,7 +192,8 @@ private[kafka] object ConsumerStage {
       if (offsets.isEmpty)
         Future.successful(Done)
       else {
-        stages.head._2.commit(this)
+        implicit val ec = akka.dispatch.ExecutionContexts.global()
+        Future.sequence(stages.map(_._2.commit(this))).map(_ => Done)
       }
     }
 
